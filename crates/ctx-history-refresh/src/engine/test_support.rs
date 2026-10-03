@@ -62,6 +62,46 @@ impl RefreshJournal for TestRefreshJournal {
     }
 }
 
+/// Fails non-terminal job-status stores once the request has been admitted.
+///
+/// `persist_job_status` runs after admission and BEFORE the executor is
+/// entered, so an error here exercises a pre-executor failure: no route was
+/// scanned, whatever the requested scope named. Stores before admission
+/// succeed so the request can be queued and reach that point.
+#[derive(Debug, Default)]
+pub(crate) struct TestFailProgressStoreJournal {
+    stores: std::sync::atomic::AtomicUsize,
+}
+
+impl RefreshJournal for TestFailProgressStoreJournal {
+    fn load(&self, _data_root: &Path) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    fn store(&self, data_root: &Path, value: &Value) -> Result<()> {
+        let terminal = matches!(
+            value.get("request_state").and_then(Value::as_str),
+            Some("published" | "failed")
+        );
+        // `running` is the state written by `persist_job_status` after
+        // admission and before the executor is entered. Queued and
+        // admission_pending stores succeed so the request can reach it.
+        let admitted = value.get("request_state").and_then(Value::as_str) == Some("running");
+        if !terminal && admitted {
+            self.stores.fetch_add(1, Ordering::SeqCst);
+            bail!("injected job status persistence failure");
+        }
+        write_daemon_job_status(&daemon_source_backed_refresh_job_path(data_root), value)
+    }
+
+    fn store_before_ack(&self, data_root: &Path, value: &Value) -> DurableAdmissionPersistence {
+        match self.store(data_root, value) {
+            Ok(()) => DurableAdmissionPersistence::Confirmed,
+            Err(error) => DurableAdmissionPersistence::Failed(error),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TestFailTerminalStoreJournal {
     terminal_stores: std::sync::atomic::AtomicUsize,

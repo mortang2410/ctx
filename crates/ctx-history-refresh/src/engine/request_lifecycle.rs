@@ -499,8 +499,17 @@ impl CoreRefreshEngine {
             RefreshFailureDiagnostic::new(FailureStage::Verification, None),
             |error| RefreshFailureDiagnostic::new(FailureStage::Execution, Some(error)),
         );
+        // A failure may only be attributed to routes this attempt really
+        // scanned. Ledger admissions are the precise record for a narrowed
+        // refresh; `physically_executed_exact_routes` covers a capture the
+        // ledger does not own, such as a fresh install. The REQUESTED scope is
+        // never a fallback: an attempt that failed before the executor was
+        // entered (persisting job status, opening the retained generation)
+        // scanned nothing, and blaming the requested routes would mark
+        // untouched routes retryable and let repeated failures pause them.
         let (attempted_routes, admitted_no_routes) = {
             let state = self.lock_state();
+            let attempt = find_attempt(&state, &request_id);
             let admitted = state
                 .route_admissions
                 .get(&request_id)
@@ -512,13 +521,12 @@ impl CoreRefreshEngine {
                 })
                 .filter(|routes| !routes.is_empty());
             let admitted_no_routes = admitted.is_none();
-            (
-                admitted.unwrap_or_else(|| match &refresh_scope {
-                    SourceBackedRefreshScope::All => BTreeSet::new(),
-                    SourceBackedRefreshScope::Exact(routes) => routes.clone(),
-                }),
-                admitted_no_routes,
-            )
+            let attempted_routes = admitted
+                .or_else(|| {
+                    attempt.and_then(|attempt| attempt.physically_executed_exact_routes.clone())
+                })
+                .unwrap_or_default();
+            (attempted_routes, admitted_no_routes)
         };
         let execution_failure_type = execution
             .as_ref()
@@ -611,7 +619,7 @@ impl CoreRefreshEngine {
                     && previous_generation.as_deref() == Some(publication.generation_id.as_str());
                 let exact_scope_mismatch = match &refresh_scope {
                     SourceBackedRefreshScope::All => None,
-                    SourceBackedRefreshScope::Exact(routes) => {
+                    SourceBackedRefreshScope::Exact(_routes) => {
                         let actual = publication
                             .route_results
                             .iter()
@@ -619,10 +627,12 @@ impl CoreRefreshEngine {
                                 SourceRouteIdentity::from_sha256(result.route_identity.clone()).ok()
                             })
                             .collect::<BTreeSet<_>>();
+                        // `attempted_routes` is what execution really scanned,
+                        // so it is the whole expectation. The requested scope
+                        // is not a fallback: it would accept a publication that
+                        // silently omitted a route it never actually scanned.
                         let expected = if no_work_republication {
                             BTreeSet::new()
-                        } else if attempted_routes.is_empty() {
-                            routes.clone()
                         } else {
                             attempted_routes.clone()
                         };

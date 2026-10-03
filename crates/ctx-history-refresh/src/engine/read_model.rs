@@ -225,6 +225,11 @@ pub(super) struct SourceBackedRefreshAttempt {
     /// from the durable job representation and terminal receipts.
     pub(super) attempt_history_progress:
         Option<ctx_history_capture_model::SharedAttemptHistoryProgress>,
+    /// Routes this attempt actually handed to physical execution, recorded
+    /// immediately before the executor is entered. It stays `None` when the
+    /// attempt never reached the executor, so a failure cannot be attributed
+    /// to routes that were never scanned.
+    pub(super) physically_executed_exact_routes: Option<BTreeSet<SourceRouteIdentity>>,
     pub(super) progress_total_sources_known: bool,
     pub(super) whole_run_eta: WholeRunEtaEstimator,
     pub(super) scanned_routes: Option<usize>,

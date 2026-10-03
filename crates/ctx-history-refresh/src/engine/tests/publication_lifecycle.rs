@@ -119,6 +119,79 @@ fn an_exact_automatic_watcher_event_between_authority_resolution_and_admission_r
 }
 
 #[test]
+fn an_exact_no_admission_persistence_failure_does_not_attribute_or_pause_the_route() {
+    // Round-4 finding. An exact automatic request whose only route fell into
+    // its watcher debounce admits nothing. When persisting job status then
+    // fails, the attempt never entered the executor, so NO route was scanned.
+    // Attributing the failure to the requested route marked it retryable and,
+    // once repeated, let the automatic retry checkpoint pause a route that had
+    // never been read at all.
+    let temp = tempfile::tempdir().unwrap();
+    let data_root = temp.path().join("data");
+    ctx_history_platform::platform_security::establish_private_data_root(&data_root).unwrap();
+    commit_source_backed_test_generation(
+        ctx_history_index::GenerationWriter::open(
+            source_backed_index_root(&data_root),
+            WriterOptions::default(),
+        )
+        .unwrap()
+        .into_writer()
+        .unwrap(),
+    )
+    .unwrap();
+    let route = route_identity(0x41);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor_calls = Arc::clone(&calls);
+    // Fail every non-terminal job-status store. `persist_job_status` runs
+    // right after admission and before the executor, so this is a
+    // pre-executor failure. It is a plain error, not a storage-full condition,
+    // so it must not become a route-level retry disposition.
+    let journal = Arc::new(TestFailProgressStoreJournal::default());
+    let coordinator = CoreRefreshEngine::with_journal_executor_and_admitted_routes(
+        Arc::clone(&journal) as Arc<dyn RefreshJournal>,
+        Arc::new(move |execution: SourceBackedRefreshExecution<'_>| {
+            executor_calls.fetch_add(1, Ordering::SeqCst);
+            let writer = ctx_history_index::GenerationWriter::open(
+                execution.index_root,
+                WriterOptions::default(),
+            )?
+            .into_writer()
+            .map_err(crate::committed_generation_recovery_error)?;
+            let commit = commit_source_backed_test_generation(writer)?;
+            Ok(empty_test_publication(commit.generation_id))
+        }),
+        [route.clone()],
+    );
+    let observed_at_ms = ledger_now_ms().saturating_sub(1_000);
+    coordinator.reconcile_watch_routes([route.clone()], EventWatermark::new(1, 0), observed_at_ms);
+    assert!(coordinator
+        .enqueue_next_dirty_route(&data_root, ledger_now_ms())
+        .unwrap());
+    // A newer watcher event lands before admission, so nothing is admitted.
+    coordinator.record_watch_routes(
+        [(route.clone(), EventWatermark::new(1, 1))],
+        ledger_now_ms(),
+    );
+
+    let run = coordinator
+        .run_next(&data_root)
+        .expect("a debounced exact automatic refresh still runs");
+    assert!(run.failed, "{:#}", run.job);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the attempt must not have reached the executor"
+    );
+    let outcome = &run.job["structured_outcome"];
+    assert_eq!(outcome["retryable_routes"], json!([]));
+    assert_eq!(outcome["blocked_routes"], json!([]));
+    assert!(
+        !coordinator.route_is_permanently_blocked_for_test(&route),
+        "a route that was never scanned must not be paused"
+    );
+}
+
+#[test]
 fn an_explicit_selected_import_admits_its_routes_rather_than_reporting_no_work() {
     // `SelectedImport` is a direct request to (re-)index now. It must not be
     // short-circuited into a no-op that silently reports success without

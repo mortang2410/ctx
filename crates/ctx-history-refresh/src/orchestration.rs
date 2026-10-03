@@ -74,6 +74,12 @@ pub(super) fn execute_source_backed_refresh(
             },
         )
     };
+    // Record exactly which routes physical execution is about to receive.
+    // A failure before this point never scanned them, so it must not be
+    // attributed to them: doing so marks untouched routes retryable and can
+    // pause them through the automatic retry checkpoint.
+    coordinator
+        .record_physically_executed_exact_routes(request_id, admitted.exact_routes().clone())?;
     executor.refresh(
         SourceBackedRefreshExecution::new(
             data_root,

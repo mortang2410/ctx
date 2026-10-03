@@ -61,7 +61,9 @@ use test_support::{
     test_refresh_runtime, test_refresh_submission, write_daemon_job_status,
 };
 #[cfg(test)]
-pub(crate) use test_support::{TestFailTerminalStoreJournal, TestRefreshJournal};
+pub(crate) use test_support::{
+    TestFailProgressStoreJournal, TestFailTerminalStoreJournal, TestRefreshJournal,
+};
 use whole_run_eta::WholeRunEtaEstimator;
 
 #[derive(Default)]
