@@ -146,7 +146,7 @@ fn an_exact_no_admission_persistence_failure_does_not_attribute_or_pause_the_rou
     // right after admission and before the executor, so this is a
     // pre-executor failure. It is a plain error, not a storage-full condition,
     // so it must not become a route-level retry disposition.
-    let journal = Arc::new(TestFailProgressStoreJournal);
+    let journal = Arc::new(TestFailProgressStoreJournal::default());
     let coordinator = CoreRefreshEngine::with_journal_executor_and_admitted_routes(
         Arc::clone(&journal) as Arc<dyn RefreshJournal>,
         Arc::new(move |execution: SourceBackedRefreshExecution<'_>| {
@@ -188,6 +188,95 @@ fn an_exact_no_admission_persistence_failure_does_not_attribute_or_pause_the_rou
     assert!(
         !coordinator.route_is_permanently_blocked_for_test(&route),
         "a route that was never scanned must not be paused"
+    );
+}
+
+#[test]
+fn an_admitted_pre_executor_persistence_failure_does_not_attribute_or_pause_the_route() {
+    // Round-5 finding, and the blind spot in the round-4 fix. Admission runs
+    // BEFORE `persist_job_status`, so a route can be genuinely admitted and
+    // then fail on the status write with the executor never entered. Preferring
+    // ledger admissions therefore blamed a route that was never read, and
+    // repeated failures on the same observation could pause it.
+    let temp = tempfile::tempdir().unwrap();
+    let data_root = temp.path().join("data");
+    ctx_history_platform::platform_security::establish_private_data_root(&data_root).unwrap();
+    commit_source_backed_test_generation(
+        ctx_history_index::GenerationWriter::open(
+            source_backed_index_root(&data_root),
+            WriterOptions::default(),
+        )
+        .unwrap()
+        .into_writer()
+        .unwrap(),
+    )
+    .unwrap();
+    let route = route_identity(0x52);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor_calls = Arc::clone(&calls);
+    let journal = Arc::new(TestFailProgressStoreJournal::default());
+    let coordinator = CoreRefreshEngine::with_journal_executor_and_admitted_routes(
+        Arc::clone(&journal) as Arc<dyn RefreshJournal>,
+        Arc::new(move |execution: SourceBackedRefreshExecution<'_>| {
+            executor_calls.fetch_add(1, Ordering::SeqCst);
+            let writer = ctx_history_index::GenerationWriter::open(
+                execution.index_root,
+                WriterOptions::default(),
+            )?
+            .into_writer()
+            .map_err(crate::committed_generation_recovery_error)?;
+            let commit = commit_source_backed_test_generation(writer)?;
+            Ok(empty_test_publication(commit.generation_id))
+        }),
+        [route.clone()],
+    );
+    // No watcher event, so the route stays due and admission succeeds.
+    coordinator.reconcile_watch_routes(
+        [route.clone()],
+        EventWatermark::new(1, 0),
+        ledger_now_ms().saturating_sub(1_000),
+    );
+    assert!(coordinator
+        .enqueue_next_dirty_route(&data_root, ledger_now_ms())
+        .unwrap());
+
+    let run = coordinator
+        .run_next(&data_root)
+        .expect("an admitted refresh that fails before execution still runs");
+    assert!(run.failed, "{:#}", run.job);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the attempt must not have reached the executor"
+    );
+    // The request really did carry an exact route, so admission had something
+    // to admit before the status write failed. (`run.scope` is the typed
+    // authority; the terminal job does not reserialize it.)
+    assert!(
+        matches!(&run.scope, SourceBackedRefreshScope::Exact(routes) if routes.contains(&route)),
+        "this test is only meaningful when the request carried an exact route scope: {:?}",
+        run.scope
+    );
+    assert_eq!(
+        journal.refused_stores(),
+        1,
+        "the injected pre-executor failure must actually fire"
+    );
+    let outcome = &run.job["structured_outcome"];
+    assert_eq!(
+        outcome["retryable_routes"],
+        json!([]),
+        "a route that was never scanned must not be marked retryable"
+    );
+    assert_eq!(outcome["blocked_routes"], json!([]));
+    assert!(
+        !coordinator.route_is_permanently_blocked_for_test(&route),
+        "a route that was never scanned must not be paused"
+    );
+    // The work itself must survive: finalization re-arms the admission.
+    assert!(
+        coordinator.has_scheduled_route_work(),
+        "the route stays scheduled for a later maintenance pass"
     );
 }
 

@@ -62,14 +62,28 @@ impl RefreshJournal for TestRefreshJournal {
     }
 }
 
-/// Fails non-terminal job-status stores once the request has been admitted.
+/// Fails the non-terminal job-status store that `persist_job_status` writes
+/// inside `execute_source_backed_refresh`, after admission and before the
+/// executor is entered.
 ///
-/// `persist_job_status` runs after admission and BEFORE the executor is
-/// entered, so an error here exercises a pre-executor failure: no route was
-/// scanned, whatever the requested scope named. Stores before admission
-/// succeed so the request can be queued and reach that point.
+/// An error there is exactly a pre-executor failure: routes were admitted, yet
+/// none was scanned. `started_at_ms` appears only on that store, so it selects
+/// it without depending on how many stores precede it. Earlier stores succeed
+/// so the request reaches that point.
+///
+/// Stores are counted so a test can assert the injection fired rather than
+/// passing vacuously.
 #[derive(Debug, Default)]
-pub(crate) struct TestFailProgressStoreJournal;
+pub(crate) struct TestFailProgressStoreJournal {
+    stores: std::sync::atomic::AtomicUsize,
+}
+
+impl TestFailProgressStoreJournal {
+    /// How many non-terminal status writes have been refused.
+    pub(super) fn refused_stores(&self) -> usize {
+        self.stores.load(Ordering::SeqCst)
+    }
+}
 
 impl RefreshJournal for TestFailProgressStoreJournal {
     fn load(&self, _data_root: &Path) -> Result<Option<Value>> {
@@ -81,11 +95,9 @@ impl RefreshJournal for TestFailProgressStoreJournal {
             value.get("request_state").and_then(Value::as_str),
             Some("published" | "failed")
         );
-        // `running` is the state written by `persist_job_status` after
-        // admission and before the executor is entered. Queued and
-        // admission_pending stores succeed so the request can reach it.
-        let admitted = value.get("request_state").and_then(Value::as_str) == Some("running");
-        if !terminal && admitted {
+        let executing = value.get("started_at_ms").is_some();
+        if !terminal && executing {
+            self.stores.fetch_add(1, Ordering::SeqCst);
             bail!("injected job status persistence failure");
         }
         write_daemon_job_status(&daemon_source_backed_refresh_job_path(data_root), value)

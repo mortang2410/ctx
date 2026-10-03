@@ -492,31 +492,39 @@ impl CoreRefreshEngine {
             |error| RefreshFailureDiagnostic::new(FailureStage::Execution, Some(error)),
         );
         // A failure may only be attributed to routes this attempt really
-        // scanned. Ledger admissions are the precise record for a narrowed
-        // refresh; `physically_executed_exact_routes` covers a capture the
-        // ledger does not own, such as a fresh install. The REQUESTED scope is
-        // never a fallback: an attempt that failed before the executor was
-        // entered (persisting job status, opening the retained generation)
-        // scanned nothing, and blaming the requested routes would mark
-        // untouched routes retryable and let repeated failures pause them.
+        // scanned. `physically_executed_exact_routes` is the boundary: it is
+        // cleared once admission completes and set immediately before
+        // `executor.refresh`, so its ABSENCE proves the attempt failed before
+        // physical execution began. No route may then be blamed, because
+        // admission happens first: a status-persistence failure would otherwise
+        // mark an admitted route retryable that was never read, and repeated
+        // failures could pause it. Route finalization already re-arms
+        // admissions after a failed attempt, so the work stays scheduled.
+        //
+        // The REQUESTED scope is never a fallback for the same reason.
         let attempted_routes = {
             let state = self.lock_state();
-            let attempt = find_attempt(&state, &request_id);
-            let admitted = state
-                .route_admissions
-                .get(&request_id)
-                .map(|admissions| {
-                    admissions
-                        .iter()
-                        .map(|admission| admission.route().clone())
-                        .collect::<BTreeSet<_>>()
-                })
-                .filter(|routes| !routes.is_empty());
-            admitted
-                .or_else(|| {
-                    attempt.and_then(|attempt| attempt.physically_executed_exact_routes.clone())
-                })
-                .unwrap_or_default()
+            match find_attempt(&state, &request_id)
+                .and_then(|attempt| attempt.physically_executed_exact_routes.clone())
+            {
+                // Failed before physical execution began: nothing was scanned.
+                None => BTreeSet::new(),
+                Some(executed_routes) => state
+                    .route_admissions
+                    .get(&request_id)
+                    .map(|admissions| {
+                        admissions
+                            .iter()
+                            .map(|admission| admission.route().clone())
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .filter(|routes| !routes.is_empty())
+                    // A narrowed refresh reports its admitted subset, which is a
+                    // subset of what execution received. A capture the ledger
+                    // does not own, such as a fresh install, reports its full
+                    // scope.
+                    .unwrap_or(executed_routes),
+            }
         };
         let execution_failure_type = execution
             .as_ref()
@@ -818,7 +826,15 @@ impl CoreRefreshEngine {
         Failed: FnOnce(&str) -> Result<()>,
     {
         let run = self.run_next_with_terminal_success(
-            execute,
+            // This closure stands in for physical execution, so the boundary is
+            // reached the moment it is entered. Recording it here keeps the
+            // harness honest: a failure it returns is a real post-execution
+            // failure and stays attributable.
+            |request_id, engine| {
+                let admitted = engine.admitted_routes_for_test(request_id)?;
+                engine.record_physically_executed_exact_routes(request_id, Some(admitted))?;
+                execute(request_id, engine)
+            },
             probe,
             |_, receipt| {
                 Ok((

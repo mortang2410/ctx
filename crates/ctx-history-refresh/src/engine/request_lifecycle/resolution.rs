@@ -203,18 +203,18 @@ impl CoreRefreshEngine {
 
     /// Records the exact routes physical execution is about to scan.
     ///
-    /// Leaving this `None` is the meaningful case: the attempt failed before
-    /// the executor was entered, so no route was scanned and a failure must not
-    /// be attributed to any of them.
+    /// `Some(routes)` is the scanned set and may be attributed a failure.
+    /// `None` means the attempt never reached the executor, so nothing was
+    /// scanned and no route may be blamed.
     pub(crate) fn record_physically_executed_exact_routes(
         &self,
         request_id: &str,
-        routes: BTreeSet<SourceRouteIdentity>,
+        routes: Option<BTreeSet<SourceRouteIdentity>>,
     ) -> Result<()> {
         let mut state = self.lock_state();
         let attempt = find_attempt_mut(&mut state, request_id)
             .ok_or_else(|| anyhow!("source refresh request `{request_id}` is unknown"))?;
-        attempt.physically_executed_exact_routes = Some(routes);
+        attempt.physically_executed_exact_routes = routes;
         Ok(())
     }
 
