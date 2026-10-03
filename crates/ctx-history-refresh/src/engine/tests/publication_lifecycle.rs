@@ -146,7 +146,7 @@ fn an_exact_no_admission_persistence_failure_does_not_attribute_or_pause_the_rou
     // right after admission and before the executor, so this is a
     // pre-executor failure. It is a plain error, not a storage-full condition,
     // so it must not become a route-level retry disposition.
-    let journal = Arc::new(TestFailProgressStoreJournal::default());
+    let journal = Arc::new(TestFailProgressStoreJournal);
     let coordinator = CoreRefreshEngine::with_journal_executor_and_admitted_routes(
         Arc::clone(&journal) as Arc<dyn RefreshJournal>,
         Arc::new(move |execution: SourceBackedRefreshExecution<'_>| {
