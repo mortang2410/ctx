@@ -492,14 +492,14 @@ impl CoreRefreshEngine {
             |error| RefreshFailureDiagnostic::new(FailureStage::Execution, Some(error)),
         );
         // A failure may only be attributed to routes this attempt really
-        // scanned. `physically_executed_exact_routes` is the boundary: it is
-        // cleared once admission completes and set immediately before
-        // `executor.refresh`, so its ABSENCE proves the attempt failed before
-        // physical execution began. No route may then be blamed, because
-        // admission happens first: a status-persistence failure would otherwise
-        // mark an admitted route retryable that was never read, and repeated
-        // failures could pause it. Route finalization already re-arms
-        // admissions after a failed attempt, so the work stays scheduled.
+        // scanned. `physically_executed_exact_routes` is that proof: it starts
+        // absent and is set immediately before `executor.refresh`, so its
+        // ABSENCE means the attempt failed before physical execution began.
+        // No route may then be blamed, because admission happens first: a
+        // status-persistence failure would otherwise mark an admitted route
+        // retryable that was never read, and repeated failures could pause it.
+        // Route finalization already re-arms admissions after a failed attempt,
+        // so the work stays scheduled.
         //
         // The REQUESTED scope is never a fallback for the same reason.
         let attempted_routes = {

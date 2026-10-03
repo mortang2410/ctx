@@ -203,9 +203,9 @@ impl CoreRefreshEngine {
 
     /// Records the exact routes physical execution is about to scan.
     ///
-    /// `Some(routes)` is the scanned set and may be attributed a failure.
-    /// `None` means the attempt never reached the executor, so nothing was
-    /// scanned and no route may be blamed.
+    /// While this is `None` the attempt has not reached the executor, so
+    /// nothing was scanned and no route may be blamed for a failure. Set it
+    /// immediately before `executor.refresh`.
     pub(crate) fn record_physically_executed_exact_routes(
         &self,
         request_id: &str,
