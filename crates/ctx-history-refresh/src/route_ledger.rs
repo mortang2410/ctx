@@ -386,29 +386,26 @@ impl DirtySourceRoutes {
         })
     }
 
-    /// Atomically admits one bounded exact-route batch.
+    /// Admits whichever routes of one bounded exact batch are due now.
+    ///
+    /// A full-catalog refresh names every installed route, including ones a
+    /// peer attempt already owns and ones a retry backoff still holds. Those
+    /// routes are simply not due: each keeps its own dirty state for the
+    /// scheduler to admit later. Rejecting the whole batch instead reported
+    /// ordinary "nothing left to do" maintenance as an internal failure, so a
+    /// single paused watcher made every later full-catalog refresh fail.
+    ///
+    /// Callers that require every named route must compare the returned routes
+    /// with the requested ones; an empty result is a successful no-op.
     pub(super) fn admit_exact_routes(
         &mut self,
         routes: &BTreeSet<SourceRouteIdentity>,
         now_ms: u64,
-    ) -> Option<Vec<DirtySourceRouteAdmission>> {
-        if routes.is_empty()
-            || routes.iter().any(|route| {
-                !self.seen_watermarks.contains_key(route)
-                    || self.dirty.get(route).is_none_or(|state| {
-                        state.permanently_blocked
-                            || state.in_flight.is_some()
-                            || state.due_at_ms() > now_ms
-                    })
-            })
-        {
-            return None;
-        }
-        let mut admissions = Vec::with_capacity(routes.len());
-        for route in routes {
-            admissions.push(self.admit_exact(route, now_ms)?);
-        }
-        Some(admissions)
+    ) -> Vec<DirtySourceRouteAdmission> {
+        routes
+            .iter()
+            .filter_map(|route| self.admit_exact(route, now_ms))
+            .collect()
     }
 
     /// Acknowledges the admitted watermark after publication or no-op proof.
@@ -735,15 +732,89 @@ mod tests {
 
         let batch = ledger.due_routes(250, 2);
         assert_eq!(batch.len(), 2);
-        let admissions = ledger
-            .admit_exact_routes(&batch, 250)
-            .expect("bounded batch admission");
+        let admissions = ledger.admit_exact_routes(&batch, 250);
         assert_eq!(admissions.len(), 2);
         assert_eq!(ledger.due_routes(250, 2).len(), 1);
 
+        // A batch naming a route the ledger has never observed admits only the
+        // routes that are due. Route 23 has no watermark, so it is not due and
+        // stays untouched rather than rejecting the batch that named it.
         let invalid = BTreeSet::from([route(22), route(23)]);
-        assert!(ledger.admit_exact_routes(&invalid, 250).is_none());
-        assert_eq!(ledger.due_routes(250, 2), BTreeSet::from([route(22)]));
+        let admissions = ledger.admit_exact_routes(&invalid, 250);
+        assert_eq!(
+            admissions
+                .iter()
+                .map(|admission| admission.route())
+                .collect::<Vec<_>>(),
+            vec![&route(22)],
+            "only the due route is admitted"
+        );
+        assert!(
+            ledger
+                .admit_exact_routes(&BTreeSet::from([route(23)]), 250)
+                .is_empty(),
+            "a route with no watermark is never admissible"
+        );
+    }
+
+    #[test]
+    fn not_due_routes_do_not_fail_an_otherwise_eligible_batch() {
+        let mut ledger = DirtySourceRoutes::default();
+        let due = route(50);
+        let backed_off = route(51);
+        let blocked = route(52);
+
+        for route in [&due, &backed_off, &blocked] {
+            ledger.record_event(route.clone(), watermark(1, 1), 0);
+        }
+        // Route 51 fails and enters retry backoff; route 52 is dispositioned
+        // permanently. Neither is due at 250 ms.
+        let admitted_backoff = ledger.admit_exact(&backed_off, 250).unwrap();
+        assert!(ledger.retryable_failure(&admitted_backoff, 250).is_some());
+        let admitted_blocked = ledger.admit_exact(&blocked, 250).unwrap();
+        assert!(ledger.permanent_failure(&admitted_blocked));
+
+        let all = BTreeSet::from([due.clone(), backed_off.clone(), blocked.clone()]);
+        let admissions = ledger.admit_exact_routes(&all, 250);
+        assert_eq!(
+            admissions
+                .iter()
+                .map(|admission| admission.route())
+                .collect::<Vec<_>>(),
+            vec![&due],
+            "only the due route may be admitted"
+        );
+
+        // Once the backoff elapses the paused route rejoins normal scheduling.
+        let admissions = ledger.admit_exact_routes(&all, 100_000);
+        assert_eq!(
+            admissions
+                .iter()
+                .map(|admission| admission.route())
+                .collect::<Vec<_>>(),
+            vec![&backed_off],
+            "the backoff route becomes admissible and the blocked one stays out"
+        );
+    }
+
+    #[test]
+    fn a_fully_clean_catalog_admits_nothing_without_failing() {
+        let mut ledger = DirtySourceRoutes::default();
+        let catalog = BTreeSet::from([route(60), route(61)]);
+
+        // Never observed: a full-catalog refresh names routes the ledger has
+        // no watermark for. That is normal on a freshly seeded install.
+        assert!(ledger.admit_exact_routes(&catalog, 250).is_empty());
+
+        ledger.seed_exact_routes(catalog.iter().cloned(), watermark(1, 1), 0);
+        let admissions = ledger.admit_exact_routes(&catalog, 250);
+        assert_eq!(admissions.len(), 2);
+
+        // Now genuinely clean: the next maintenance pass has nothing to do.
+        for admission in &admissions {
+            assert!(ledger.acknowledge(admission));
+        }
+        assert!(ledger.admit_exact_routes(&catalog, 1_000_000).is_empty());
     }
 
     #[test]
@@ -765,9 +836,11 @@ mod tests {
             batch,
             BTreeSet::from([oldest.clone(), equal_time_older.clone()])
         );
-        ledger
-            .admit_exact_routes(&batch, 270)
-            .expect("oldest-first batch admission");
+        assert_eq!(
+            ledger.admit_exact_routes(&batch, 270).len(),
+            2,
+            "oldest-first batch admission"
+        );
         assert_eq!(
             ledger.due_routes(270, 2),
             BTreeSet::from([equal_time_newer, newest])

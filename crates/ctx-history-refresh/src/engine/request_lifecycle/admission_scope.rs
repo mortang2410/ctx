@@ -126,16 +126,11 @@ impl CoreRefreshEngine {
                 );
             }
         }
-        let admissions = if exact_routes.is_empty() {
-            Vec::new()
-        } else {
-            state
-                .dirty_routes
-                .admit_exact_routes(&exact_routes, now_ms)
-                .ok_or_else(|| {
-                    anyhow!("one or more exact source routes are no longer due for admission")
-                })?
-        };
+        // A route that is clean, blocked, in flight, or still inside its retry
+        // backoff is simply not due. Admitting the eligible subset keeps those
+        // routes dirty for the scheduler instead of failing the whole request:
+        // with every route clean, "nothing to do" is a successful no-op.
+        let admissions = state.dirty_routes.admit_exact_routes(&exact_routes, now_ms);
         // An exhaustive obligation is transferred to this admitted attempt.
         // Subsequent watcher evidence re-adds its own reason, while failure
         // finalization re-arms this attempt's reason.  Do not leave cleanup
