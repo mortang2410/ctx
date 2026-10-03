@@ -181,6 +181,7 @@ impl CoreRefreshEngine {
             .flatten()
             .map(|admission| admission.route().clone())
             .collect::<Vec<_>>();
+        let admitted_routes_set = admitted_routes.iter().cloned().collect::<BTreeSet<_>>();
         let mut route_worksets = BTreeMap::new();
         for route in admitted_routes {
             if let Some(workset) = state.route_worksets.remove(&route) {
@@ -189,7 +190,14 @@ impl CoreRefreshEngine {
                 }
             }
         }
-        admitted_authority.with_execution_facts(route_worksets)
+        admitted_authority
+            // Ledger admission may admit fewer routes than were requested: a
+            // peer owns some, others hold a retry backoff or are blocked.
+            // Physical execution must cover exactly the admitted subset, or a
+            // deferred route gets scanned with no admission to acknowledge it
+            // and its failure escapes ledger backoff.
+            .narrow_to_admitted(&admitted_routes_set)?
+            .with_execution_facts(route_worksets)
     }
 
     #[cfg(test)]

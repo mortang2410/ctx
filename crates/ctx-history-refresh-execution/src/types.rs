@@ -629,6 +629,29 @@ impl AdmittedRefresh {
         Ok(self)
     }
 
+    /// Narrows physical execution to the routes that were actually admitted.
+    ///
+    /// Partial ledger admission is legitimate: a peer attempt may own some
+    /// routes and a retry backoff may hold others. Execution must then cover
+    /// only the admitted subset, so every route it scans has an admission to
+    /// acknowledge and every failure it observes reaches the ledger.
+    ///
+    /// An empty admitted set is left unnarrowed. `AdmittedRefresh` cannot
+    /// represent a selected refresh with no routes, and narrowing to empty
+    /// would downgrade `publication_scope` from `All` to `Exact`, which the
+    /// exhaustive-reconciliation and explicit-catalog checks rely on. The
+    /// caller re-scans the catalog in that case, which is wasteful but sound:
+    /// those routes are already clean, so the rescan is a no-op publication.
+    pub fn narrow_to_admitted(
+        self,
+        admitted_routes: &BTreeSet<SourceRouteIdentity>,
+    ) -> Result<Self> {
+        if admitted_routes.is_empty() || *admitted_routes == self.exact_routes {
+            return Ok(self);
+        }
+        self.narrow_to(admitted_routes.clone())
+    }
+
     pub fn with_execution_facts(
         mut self,
         route_worksets: BTreeMap<SourceRouteIdentity, SourceBackedRefreshWorkset>,

@@ -384,6 +384,113 @@ fn selected_route_facts_cannot_attach_unadmitted_work() {
 }
 
 #[test]
+fn partial_ledger_admission_narrows_physical_execution_to_the_admitted_subset() {
+    // The ledger may admit fewer routes than were requested: a peer attempt
+    // owns some, a retry backoff holds others. Execution must then scan only
+    // the admitted subset, or a deferred route is captured with no admission to
+    // acknowledge it and its failure escapes ledger backoff entirely.
+    let admitted_route = SourceRouteIdentity::from_sha256("11".repeat(32)).unwrap();
+    let deferred_route = SourceRouteIdentity::from_sha256("22".repeat(32)).unwrap();
+    let discovery = SourceBackedAdmittedDiscovery::new(
+        DiscoveryReport {
+            sources: Vec::new(),
+            issues: Vec::new(),
+        },
+        StdDuration::ZERO,
+        SourceBackedProviderRegistry::new().watch_catalog(),
+    );
+    let requested = BTreeSet::from([admitted_route.clone(), deferred_route.clone()]);
+    let admitted = BTreeSet::from([admitted_route.clone()]);
+
+    let narrowed = AdmittedRefresh::for_test(
+        AdmittedRefreshCoverage::CompleteCatalog,
+        requested.clone(),
+        discovery,
+    )
+    .unwrap()
+    .narrow_to_admitted(&admitted)
+    .unwrap();
+
+    assert_eq!(
+        narrowed.exact_routes(),
+        &admitted,
+        "execution must cover exactly the admitted subset, never the deferred route"
+    );
+    assert_eq!(
+        narrowed.coverage(),
+        AdmittedRefreshCoverage::SelectedRoutes,
+        "a narrowed refresh is no longer complete-catalog"
+    );
+    assert_eq!(
+        narrowed.publication_scope(),
+        SourceBackedRefreshScope::Exact(admitted.clone()),
+        "the published scope must match what was actually executed"
+    );
+}
+
+#[test]
+fn a_fully_admitted_batch_keeps_its_catalog_coverage() {
+    let route = SourceRouteIdentity::from_sha256("33".repeat(32)).unwrap();
+    let discovery = SourceBackedAdmittedDiscovery::new(
+        DiscoveryReport {
+            sources: Vec::new(),
+            issues: Vec::new(),
+        },
+        StdDuration::ZERO,
+        SourceBackedProviderRegistry::new().watch_catalog(),
+    );
+    let admitted = AdmittedRefresh::for_test(
+        AdmittedRefreshCoverage::CompleteCatalog,
+        BTreeSet::from([route.clone()]),
+        discovery,
+    )
+    .unwrap()
+    .narrow_to_admitted(&BTreeSet::from([route]))
+    .unwrap();
+
+    assert_eq!(
+        admitted.coverage(),
+        AdmittedRefreshCoverage::CompleteCatalog,
+        "an unchanged route set must not silently downgrade a catalog refresh \
+         to a selected one, which would weaken exhaustive-reconciliation checks"
+    );
+}
+
+#[test]
+fn empty_admission_keeps_catalog_coverage_and_never_narrows_to_empty() {
+    // `narrow_to` rejects an empty set because a selected refresh must name at
+    // least one route. An empty admission therefore must NOT narrow: doing so
+    // would also flip publication_scope from All to Exact.
+    let route = SourceRouteIdentity::from_sha256("44".repeat(32)).unwrap();
+    let discovery = SourceBackedAdmittedDiscovery::new(
+        DiscoveryReport {
+            sources: Vec::new(),
+            issues: Vec::new(),
+        },
+        StdDuration::ZERO,
+        SourceBackedProviderRegistry::new().watch_catalog(),
+    );
+    let admitted = AdmittedRefresh::for_test(
+        AdmittedRefreshCoverage::CompleteCatalog,
+        BTreeSet::from([route.clone()]),
+        discovery,
+    )
+    .unwrap()
+    .narrow_to_admitted(&BTreeSet::new())
+    .unwrap();
+
+    assert_eq!(
+        admitted.coverage(),
+        AdmittedRefreshCoverage::CompleteCatalog
+    );
+    assert_eq!(
+        admitted.exact_routes(),
+        &BTreeSet::from([route]),
+        "an empty admission leaves the requested routes in place for a no-op rescan"
+    );
+}
+
+#[test]
 fn selected_execution_never_widens_beyond_its_admitted_report() {
     let temp = tempfile::tempdir().unwrap();
     let data_root = temp.path().join("data");
