@@ -461,14 +461,7 @@ impl CoreRefreshEngine {
         }
         drop(state);
 
-        let (
-            request_id,
-            previous_generation,
-            requested_catalog,
-            refresh_scope,
-            queued_batch,
-            refresh_intent,
-        ) = {
+        let (request_id, previous_generation, requested_catalog, refresh_scope, queued_batch) = {
             let mut state = self.lock_state();
             let request_id = state.active_request_id.clone()?;
             let queued_batch = QueuedRefreshBatch::snapshot(&state, &request_id);
@@ -489,7 +482,6 @@ impl CoreRefreshEngine {
                 attempt.requested_explicit_source_catalog().cloned(),
                 attempt.refresh_scope.clone(),
                 queued_batch,
-                attempt.intent.clone(),
             )
         };
 
@@ -507,7 +499,7 @@ impl CoreRefreshEngine {
         // entered (persisting job status, opening the retained generation)
         // scanned nothing, and blaming the requested routes would mark
         // untouched routes retryable and let repeated failures pause them.
-        let (attempted_routes, admitted_no_routes) = {
+        let attempted_routes = {
             let state = self.lock_state();
             let attempt = find_attempt(&state, &request_id);
             let admitted = state
@@ -520,13 +512,11 @@ impl CoreRefreshEngine {
                         .collect::<BTreeSet<_>>()
                 })
                 .filter(|routes| !routes.is_empty());
-            let admitted_no_routes = admitted.is_none();
-            let attempted_routes = admitted
+            admitted
                 .or_else(|| {
                     attempt.and_then(|attempt| attempt.physically_executed_exact_routes.clone())
                 })
-                .unwrap_or_default();
-            (attempted_routes, admitted_no_routes)
+                .unwrap_or_default()
         };
         let execution_failure_type = execution
             .as_ref()
@@ -605,18 +595,11 @@ impl CoreRefreshEngine {
                 // against the requested scope would reject every successful
                 // partial admission as an omitted or added route outcome.
                 //
-                // The one exception is a no-work republication: automatic
-                // maintenance that admitted nothing republishes the retained
-                // generation, which carries no route outcomes at all. Expecting
-                // the requested exact routes there would fail a refresh whose
-                // retained generation verified perfectly well. The fresh-install
-                // capture and explicit imports are excluded, because both
-                // publish under a different generation id and must therefore
-                // report every requested route.
-                let no_work_republication = admitted_no_routes
-                    && refresh_intent == RefreshIntent::AutomaticMaintenance
-                    && publication.route_results.is_empty()
-                    && previous_generation.as_deref() == Some(publication.generation_id.as_str());
+                // `attempted_routes` is empty for a no-work republication:
+                // automatic maintenance that admitted nothing never enters the
+                // executor, so nothing was scanned and the publication carries
+                // no route outcomes to account for. A fresh-install capture
+                // records the routes it sends, so it is still checked in full.
                 let exact_scope_mismatch = match &refresh_scope {
                     SourceBackedRefreshScope::All => None,
                     SourceBackedRefreshScope::Exact(_routes) => {
@@ -627,15 +610,7 @@ impl CoreRefreshEngine {
                                 SourceRouteIdentity::from_sha256(result.route_identity.clone()).ok()
                             })
                             .collect::<BTreeSet<_>>();
-                        // `attempted_routes` is what execution really scanned,
-                        // so it is the whole expectation. The requested scope
-                        // is not a fallback: it would accept a publication that
-                        // silently omitted a route it never actually scanned.
-                        let expected = if no_work_republication {
-                            BTreeSet::new()
-                        } else {
-                            attempted_routes.clone()
-                        };
+                        let expected = attempted_routes.clone();
                         (actual != expected || publication.route_results.len() != expected.len())
                             .then_some((expected, actual))
                     }
