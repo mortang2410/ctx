@@ -461,7 +461,14 @@ impl CoreRefreshEngine {
         }
         drop(state);
 
-        let (request_id, previous_generation, requested_catalog, refresh_scope, queued_batch) = {
+        let (
+            request_id,
+            previous_generation,
+            requested_catalog,
+            refresh_scope,
+            queued_batch,
+            refresh_intent,
+        ) = {
             let mut state = self.lock_state();
             let request_id = state.active_request_id.clone()?;
             let queued_batch = QueuedRefreshBatch::snapshot(&state, &request_id);
@@ -482,6 +489,7 @@ impl CoreRefreshEngine {
                 attempt.requested_explicit_source_catalog().cloned(),
                 attempt.refresh_scope.clone(),
                 queued_batch,
+                attempt.intent.clone(),
             )
         };
 
@@ -491,9 +499,9 @@ impl CoreRefreshEngine {
             RefreshFailureDiagnostic::new(FailureStage::Verification, None),
             |error| RefreshFailureDiagnostic::new(FailureStage::Execution, Some(error)),
         );
-        let attempted_routes = {
+        let (attempted_routes, admitted_no_routes) = {
             let state = self.lock_state();
-            state
+            let admitted = state
                 .route_admissions
                 .get(&request_id)
                 .map(|admissions| {
@@ -502,11 +510,15 @@ impl CoreRefreshEngine {
                         .map(|admission| admission.route().clone())
                         .collect::<BTreeSet<_>>()
                 })
-                .filter(|routes| !routes.is_empty())
-                .unwrap_or_else(|| match &refresh_scope {
+                .filter(|routes| !routes.is_empty());
+            let admitted_no_routes = admitted.is_none();
+            (
+                admitted.unwrap_or_else(|| match &refresh_scope {
                     SourceBackedRefreshScope::All => BTreeSet::new(),
                     SourceBackedRefreshScope::Exact(routes) => routes.clone(),
-                })
+                }),
+                admitted_no_routes,
+            )
         };
         let execution_failure_type = execution
             .as_ref()
@@ -584,6 +596,19 @@ impl CoreRefreshEngine {
                 // publication carries exactly the admitted routes. Comparing
                 // against the requested scope would reject every successful
                 // partial admission as an omitted or added route outcome.
+                //
+                // The one exception is a no-work republication: automatic
+                // maintenance that admitted nothing republishes the retained
+                // generation, which carries no route outcomes at all. Expecting
+                // the requested exact routes there would fail a refresh whose
+                // retained generation verified perfectly well. The fresh-install
+                // capture and explicit imports are excluded, because both
+                // publish under a different generation id and must therefore
+                // report every requested route.
+                let no_work_republication = admitted_no_routes
+                    && refresh_intent == RefreshIntent::AutomaticMaintenance
+                    && publication.route_results.is_empty()
+                    && previous_generation.as_deref() == Some(publication.generation_id.as_str());
                 let exact_scope_mismatch = match &refresh_scope {
                     SourceBackedRefreshScope::All => None,
                     SourceBackedRefreshScope::Exact(routes) => {
@@ -594,7 +619,9 @@ impl CoreRefreshEngine {
                                 SourceRouteIdentity::from_sha256(result.route_identity.clone()).ok()
                             })
                             .collect::<BTreeSet<_>>();
-                        let expected = if attempted_routes.is_empty() {
+                        let expected = if no_work_republication {
+                            BTreeSet::new()
+                        } else if attempted_routes.is_empty() {
                             routes.clone()
                         } else {
                             attempted_routes.clone()

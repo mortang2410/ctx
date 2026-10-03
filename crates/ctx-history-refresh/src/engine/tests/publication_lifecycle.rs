@@ -41,6 +41,84 @@ fn a_clean_catalog_automatic_maintenance_reports_no_work_instead_of_failing() {
 }
 
 #[test]
+fn an_exact_automatic_watcher_event_between_authority_resolution_and_admission_republishes_retained_generation_without_failing(
+) {
+    // The watcher-debounce window of the reported incident. Authority is
+    // resolved for one exact route, then a newer watcher event arrives BEFORE
+    // admission. Exact automatic maintenance does not reseed, so the route is
+    // not due for 250ms and admission comes back empty while the route is
+    // genuinely unindexed.
+    //
+    // That must complete as a republication of the retained generation: it is
+    // not a failure, and it must not capture routes the ledger does not own.
+    // Before this coverage, the terminal validation still expected a route
+    // outcome for the requested exact scope and marked the refresh failed.
+    let temp = tempfile::tempdir().unwrap();
+    let data_root = temp.path().join("data");
+    ctx_history_platform::platform_security::establish_private_data_root(&data_root).unwrap();
+    commit_source_backed_test_generation(
+        ctx_history_index::GenerationWriter::open(
+            source_backed_index_root(&data_root),
+            WriterOptions::default(),
+        )
+        .unwrap()
+        .into_writer()
+        .unwrap(),
+    )
+    .unwrap();
+    let route = route_identity(0x2d);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor_calls = Arc::clone(&calls);
+    // The no-work branch republishes the retained generation directly, so the
+    // executor must never be entered: capturing is exactly what is forbidden
+    // while the ledger owns no admission.
+    let coordinator = CoreRefreshEngine::with_executor_and_admitted_routes(
+        Arc::new(move |execution: SourceBackedRefreshExecution<'_>| {
+            executor_calls.fetch_add(1, Ordering::SeqCst);
+            let writer = ctx_history_index::GenerationWriter::open(
+                execution.index_root,
+                WriterOptions::default(),
+            )?
+            .into_writer()
+            .map_err(crate::committed_generation_recovery_error)?;
+            let commit = commit_source_backed_test_generation(writer)?;
+            Ok(empty_test_publication(commit.generation_id))
+        }),
+        [route.clone()],
+    );
+    let observed_at_ms = ledger_now_ms().saturating_sub(1_000);
+    coordinator.reconcile_watch_routes([route.clone()], EventWatermark::new(1, 0), observed_at_ms);
+    // Resolve authority while the route is due.
+    assert!(coordinator
+        .enqueue_next_dirty_route(&data_root, ledger_now_ms())
+        .unwrap());
+    // Then a newer watcher event lands before admission, putting the route
+    // inside its debounce window so nothing is admitted.
+    coordinator.record_watch_routes(
+        [(route.clone(), EventWatermark::new(1, 1))],
+        ledger_now_ms(),
+    );
+
+    let run = coordinator
+        .run_next(&data_root)
+        .expect("a debounced exact automatic refresh still runs");
+    assert!(!run.failed, "{:#}", run.job);
+    assert!(
+        !run.did_work,
+        "republishing the retained generation is not new work"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a refresh with no admitted route must not scan"
+    );
+    assert!(
+        coordinator.has_scheduled_route_work(),
+        "the debounced route stays scheduled for a later maintenance pass"
+    );
+}
+
+#[test]
 fn an_explicit_selected_import_admits_its_routes_rather_than_reporting_no_work() {
     // `SelectedImport` is a direct request to (re-)index now. It must not be
     // short-circuited into a no-op that silently reports success without
