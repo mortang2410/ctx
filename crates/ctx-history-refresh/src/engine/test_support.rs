@@ -69,9 +69,7 @@ impl RefreshJournal for TestRefreshJournal {
 /// scanned, whatever the requested scope named. Stores before admission
 /// succeed so the request can be queued and reach that point.
 #[derive(Debug, Default)]
-pub(crate) struct TestFailProgressStoreJournal {
-    stores: std::sync::atomic::AtomicUsize,
-}
+pub(crate) struct TestFailProgressStoreJournal;
 
 impl RefreshJournal for TestFailProgressStoreJournal {
     fn load(&self, _data_root: &Path) -> Result<Option<Value>> {
@@ -88,7 +86,6 @@ impl RefreshJournal for TestFailProgressStoreJournal {
         // admission_pending stores succeed so the request can reach it.
         let admitted = value.get("request_state").and_then(Value::as_str) == Some("running");
         if !terminal && admitted {
-            self.stores.fetch_add(1, Ordering::SeqCst);
             bail!("injected job status persistence failure");
         }
         write_daemon_job_status(&daemon_source_backed_refresh_job_path(data_root), value)
