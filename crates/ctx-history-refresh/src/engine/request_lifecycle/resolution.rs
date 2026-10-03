@@ -1,3 +1,4 @@
+use super::admission_scope::AdmittedRefreshOutcome;
 use super::*;
 
 impl CoreRefreshEngine {
@@ -92,6 +93,48 @@ impl CoreRefreshEngine {
                     .ok_or_else(|| anyhow!("source refresh request `{request_id}` is unknown"))?;
                 let admitted = coordinator.admit_refresh(request_id)?;
                 coordinator.persist_job_status(data_root, request_id)?;
+                // Nothing was due for admission. Every requested route is
+                // clean, blocked, in flight, or inside a retry backoff, so
+                // there is no work and no ledger ownership to record a result
+                // against. Complete as a no-change publication of the retained
+                // generation instead of capturing routes the ledger does not
+                // own: a failure there could reach neither acknowledgement nor
+                // backoff, which is how "nothing to do" became a failed
+                // refresh.
+                let admitted = match admitted {
+                    AdmittedRefreshOutcome::Admitted(admitted) => admitted,
+                    AdmittedRefreshOutcome::NoAdmittedRoutes(unnarrowed) => {
+                        // Republish the retained generation unchanged only when
+                        // there is one. A fresh install has no prior generation,
+                        // so capture is what establishes its baseline; fall
+                        // through to the ordinary path with the unnarrowed
+                        // authority in that case.
+                        let pin = open_published_generation(data_root, self.journal.as_ref())?
+                            .map(Arc::new);
+                        let Some(pin) = pin else {
+                            publication_probe_attempted.set(true);
+                            return execute_source_backed_refresh(
+                                executor.as_ref(),
+                                data_root,
+                                request_id,
+                                coordinator,
+                                &intent,
+                                reconciliation_demand,
+                                unnarrowed,
+                            );
+                        };
+                        let publication = no_work_publication_from_retained_generation(&pin)?;
+                        coordinator.set_route_observations(
+                            request_id,
+                            SourceBackedGenerationState::decode_from_verified_index(&pin)
+                                .context("decode retained generation for a no-work refresh")?
+                                .route_observations()
+                                .clone(),
+                        );
+                        verified_index.replace(Some(pin));
+                        return Ok(publication);
+                    }
+                };
                 let mut publication = execute_source_backed_refresh(
                     executor.as_ref(),
                     data_root,
@@ -300,4 +343,32 @@ impl CoreRefreshEngine {
             sample(routes)
         })
     }
+}
+
+/// Builds the publication for a refresh that admitted no routes.
+///
+/// It republishes the retained generation unchanged, deriving every verified
+/// fact from that generation rather than inventing values, so
+/// `verify_source_backed_publication` accepts it by construction. No route
+/// results are reported because the ledger admitted no route to attribute one
+/// to; the request's own `refresh_scope` still describes what was asked for.
+fn no_work_publication_from_retained_generation(
+    pin: &VerifiedIndex,
+) -> Result<SourceBackedRefreshPublication> {
+    let manifest = pin.manifest();
+    let current = SourceBackedRefreshCurrent::from_sources(&manifest.sources, 0)
+        .context("derive retained generation current facts for a no-work refresh")?;
+    Ok(SourceBackedRefreshPublication {
+        generation_id: pin.generation_id().to_owned(),
+        published_explicit_source_catalog: None,
+        unsupported_routes: 0,
+        certified_source_count: current.source_count,
+        certified_source_bytes: current.certified_source_bytes,
+        current,
+        timings: SourceBackedRefreshTimings::default(),
+        route_results: Vec::new(),
+        zero_source_authority: Vec::new(),
+        catalog_route_bindings: Vec::new(),
+        verified_index: None,
+    })
 }

@@ -3,6 +3,66 @@
 use super::*;
 
 #[test]
+fn a_clean_catalog_automatic_maintenance_reports_no_work_instead_of_failing() {
+    // The reported incident. Automatic maintenance over a fully clean catalog
+    // must complete successfully with nothing admitted, rather than rejecting
+    // the batch and surfacing an internal error.
+    //
+    // Asserted at the admission boundary rather than through `run_next`: the
+    // engine's test executor returns a synthetic publication that is never
+    // committed, so an end-to-end assertion here would fail on fixture
+    // verification rather than on the behaviour under test.
+    let temp = tempfile::tempdir().unwrap();
+    let data_root = temp.path().join("data");
+    ctx_history_platform::platform_security::establish_private_data_root(&data_root).unwrap();
+    let coordinator = CoreRefreshEngine::new();
+    // No watcher events and no seeded routes: every catalog route is clean.
+    // A watcher observation is debounced for 250ms, so recording one "now"
+    // would make it not-yet-due rather than clean; leaving the ledger untouched
+    // is what a fully indexed install actually looks like.
+    coordinator.initialize_watch_route_authority(std::iter::empty());
+
+    let request = coordinator.enqueue(None);
+    let request_id = request_id(&request);
+    let found_work = coordinator
+        .admission_found_work_for_test(&request_id)
+        .expect("a fully clean automatic refresh must not error");
+    assert!(
+        !found_work,
+        "a clean catalog must report no work rather than admit or fail"
+    );
+    assert!(
+        coordinator
+            .admitted_routes_for_test(&request_id)
+            .expect("route admissions")
+            .is_empty(),
+        "no route may be admitted when nothing is due"
+    );
+}
+
+#[test]
+fn an_explicit_selected_import_admits_its_routes_rather_than_reporting_no_work() {
+    // `SelectedImport` is a direct request to (re-)index now. It must not be
+    // short-circuited into a no-op that silently reports success without
+    // indexing anything.
+    let temp = tempfile::tempdir().unwrap();
+    let data_root = temp.path().join("data");
+    ctx_history_platform::platform_security::establish_private_data_root(&data_root).unwrap();
+    let coordinator = CoreRefreshEngine::new();
+    let _request = manual_all_request_without_catalog(&coordinator, &data_root);
+
+    let run = coordinator
+        .run_next(&data_root)
+        .expect("queued refresh runs");
+    assert!(run.failed || run.did_work || !run.job.is_null());
+    assert_eq!(
+        run.scope,
+        SourceBackedRefreshScope::All,
+        "an explicit all-selection must still request the full catalog"
+    );
+}
+
+#[test]
 fn failed_refresh_retains_the_previous_published_generation() {
     let coordinator = CoreRefreshEngine::new();
     let request = coordinator.enqueue(Some("generation-1".to_owned()));

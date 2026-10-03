@@ -577,6 +577,13 @@ impl CoreRefreshEngine {
         };
         let verified = match verified {
             Ok((observed, publication)) => {
+                // Validate against the routes this attempt actually executed,
+                // not the routes it originally requested. Admission may admit a
+                // strict subset (a peer owns some, a retry backoff holds
+                // others), and execution is narrowed to that subset, so the
+                // publication carries exactly the admitted routes. Comparing
+                // against the requested scope would reject every successful
+                // partial admission as an omitted or added route outcome.
                 let exact_scope_mismatch = match &refresh_scope {
                     SourceBackedRefreshScope::All => None,
                     SourceBackedRefreshScope::Exact(routes) => {
@@ -587,13 +594,18 @@ impl CoreRefreshEngine {
                                 SourceRouteIdentity::from_sha256(result.route_identity.clone()).ok()
                             })
                             .collect::<BTreeSet<_>>();
-                        (actual != *routes || publication.route_results.len() != routes.len())
-                            .then_some((routes, actual))
+                        let expected = if attempted_routes.is_empty() {
+                            routes.clone()
+                        } else {
+                            attempted_routes.clone()
+                        };
+                        (actual != expected || publication.route_results.len() != expected.len())
+                            .then_some((expected, actual))
                     }
                 };
                 if let Some((expected, actual)) = exact_scope_mismatch {
                     Err(format!(
-                        "validate terminal Core publication: exact refresh omitted or added a selected route outcome (expected={expected:?}, actual={actual:?}, result_count={})",
+                        "validate terminal Core publication: exact refresh omitted or added an executed route outcome (expected={expected:?}, actual={actual:?}, result_count={})",
                         publication.route_results.len()
                     ))
                 } else {

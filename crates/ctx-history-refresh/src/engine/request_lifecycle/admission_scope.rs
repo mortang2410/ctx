@@ -1,5 +1,29 @@
 use super::*;
 
+/// What ledger admission decided for one refresh request.
+///
+/// `NoAdmittedRoutes` is the ordinary "nothing to do" case on a fully-indexed
+/// install: every requested route is clean, blocked, in flight, or inside a
+/// retry backoff. The request must complete without capturing, because those
+/// routes carry no admission to acknowledge a result or record a failure.
+///
+/// It carries the unnarrowed authority so the caller can still fall back to
+/// capturing when there is no retained generation to republish: a fresh install
+/// has nothing to be a no-op relative to, and capture is what establishes its
+/// first generation.
+pub(super) enum AdmittedRefreshOutcome {
+    Admitted(ctx_history_refresh_execution::AdmittedRefresh),
+    NoAdmittedRoutes(ctx_history_refresh_execution::AdmittedRefresh),
+}
+
+impl AdmittedRefreshOutcome {
+    /// Whether admission found no work, so capture must not run.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_no_work(&self) -> bool {
+        matches!(self, Self::NoAdmittedRoutes(_))
+    }
+}
+
 impl CoreRefreshEngine {
     pub(crate) fn attempt_history_progress(
         &self,
@@ -47,10 +71,7 @@ impl CoreRefreshEngine {
             .and_then(|attempt| attempt.requested_explicit_source_catalog().cloned())
     }
 
-    pub(super) fn admit_refresh(
-        &self,
-        request_id: &str,
-    ) -> Result<ctx_history_refresh_execution::AdmittedRefresh> {
+    pub(super) fn admit_refresh(&self, request_id: &str) -> Result<AdmittedRefreshOutcome> {
         let now_ms = source_route_ledger_now_ms();
         let mut state = self.lock_state();
         if state.route_admissions.contains_key(request_id) {
@@ -190,14 +211,46 @@ impl CoreRefreshEngine {
                 }
             }
         }
-        admitted_authority
-            // Ledger admission may admit fewer routes than were requested: a
-            // peer owns some, others hold a retry backoff or are blocked.
+        // An automatic route split can only be planned against a full-catalog
+        // publication with exhaustive demand: `prepare_automatic_route_splits`
+        // rejects an Exact scope. Narrowing an All attempt to Exact would turn
+        // a split migration into a failed refresh, so leave those unnarrowed.
+        let requires_full_catalog_publication =
+            find_attempt(&state, request_id).is_some_and(|attempt| {
+                matches!(scope, SourceBackedRefreshScope::All)
+                    && attempt.reconciliation_demand == SourceBackedReconciliationDemand::Exhaustive
+            });
+        // Nothing was admissible: every requested route is clean, blocked,
+        // in flight, or inside a retry backoff. For AUTOMATIC MAINTENANCE that
+        // is ordinary housekeeping with no work to do. It must not capture:
+        // scanning routes the ledger does not own means a failure could reach
+        // neither acknowledgement nor backoff, which is how "nothing to do"
+        // became a failed refresh.
+        //
+        // An EXPLICIT demand is different. `SelectedImport` is a user or CLI
+        // request to (re-)index those routes now, and it seeds them dirty
+        // above precisely so admission cannot come back empty. If it somehow
+        // does, fall through to capture: honouring the explicit request is
+        // correct, and an unexpected empty admission must not silently become
+        // a no-op that reports success.
+        let automatic_no_work =
+            admitted_routes_set.is_empty() && intent == RefreshIntent::AutomaticMaintenance;
+        if automatic_no_work {
+            return Ok(AdmittedRefreshOutcome::NoAdmittedRoutes(
+                admitted_authority.with_execution_facts(route_worksets)?,
+            ));
+        }
+        let admitted_authority = if requires_full_catalog_publication {
+            admitted_authority
+        } else {
             // Physical execution must cover exactly the admitted subset, or a
             // deferred route gets scanned with no admission to acknowledge it
             // and its failure escapes ledger backoff.
-            .narrow_to_admitted(&admitted_routes_set)?
-            .with_execution_facts(route_worksets)
+            admitted_authority.narrow_to_admitted(&admitted_routes_set)?
+        };
+        Ok(AdmittedRefreshOutcome::Admitted(
+            admitted_authority.with_execution_facts(route_worksets)?,
+        ))
     }
 
     #[cfg(test)]
@@ -209,6 +262,35 @@ impl CoreRefreshEngine {
         if self.refresh_scope(request_id).as_ref() != Some(scope) {
             bail!("test source refresh scope does not match the queued request");
         }
-        self.admit_refresh(request_id).map(|_| BTreeSet::new())
+        self.admit_refresh(request_id).map(|outcome| match outcome {
+            AdmittedRefreshOutcome::Admitted(_) | AdmittedRefreshOutcome::NoAdmittedRoutes(_) => {
+                BTreeSet::new()
+            }
+        })
+    }
+
+    /// Whether real admission found work for this request.
+    ///
+    /// Returns false when admission had nothing due, which is the successful
+    /// no-op that must not reach capture.
+    #[cfg(test)]
+    pub fn admission_found_work_for_test(&self, request_id: &str) -> Result<bool> {
+        Ok(!self.admit_refresh(request_id)?.is_no_work())
+    }
+
+    /// Whether ledger admission found any route due for this request.
+    #[cfg(test)]
+    pub fn admitted_routes_for_test(
+        &self,
+        request_id: &str,
+    ) -> Result<BTreeSet<SourceRouteIdentity>> {
+        let state = self.lock_state();
+        Ok(state
+            .route_admissions
+            .get(request_id)
+            .into_iter()
+            .flatten()
+            .map(|admission| admission.route().clone())
+            .collect())
     }
 }
